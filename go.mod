@@ -2,6 +2,8 @@ module github.com/devfile/library
 
 go 1.15
 
+replace github.com/devfile/registry-support/index/generator => github.com/devfile/registry-support/index/generator v0.0.0-20220624203950-e7282a4695b6
+
 require (
 	github.com/devfile/api/v2 v2.2.0
 	github.com/devfile/registry-support/index/generator v0.0.0-20220527155645-8328a8a883be // indirect
