@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@
 package parser
 
 import (
-	"github.com/stretchr/testify/assert"
 	"testing"
 
-	v200 "github.com/devfile/library/pkg/devfile/parser/data/v2/2.0.0"
+	"github.com/stretchr/testify/assert"
+
+	v200 "github.com/devfile/library/v2/pkg/devfile/parser/data/v2/2.0.0"
 )
 
 const (

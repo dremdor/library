@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,23 +19,25 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/devfile/api/v2/pkg/attributes"
-	registryLibrary "github.com/devfile/registry-support/registry-library/library"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 
-	devfileCtx "github.com/devfile/library/pkg/devfile/parser/context"
-	"github.com/devfile/library/pkg/devfile/parser/data"
-	"github.com/devfile/library/pkg/devfile/parser/data/v2/common"
-	"github.com/devfile/library/pkg/util"
+	"github.com/devfile/api/v2/pkg/attributes"
+	devfileCtx "github.com/devfile/library/v2/pkg/devfile/parser/context"
+	"github.com/devfile/library/v2/pkg/devfile/parser/data"
+	"github.com/devfile/library/v2/pkg/devfile/parser/data/v2/common"
+	errPkg "github.com/devfile/library/v2/pkg/devfile/parser/errors"
+	"github.com/devfile/library/v2/pkg/util"
+	registryLibrary "github.com/devfile/registry-support/registry-library/library"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
-	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	parserUtil "github.com/devfile/library/v2/pkg/devfile/parser/util"
 
 	v1 "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	apiOverride "github.com/devfile/api/v2/pkg/utils/overriding"
@@ -63,7 +65,7 @@ func parseDevfile(d DevfileObj, resolveCtx *resolutionContextTree, tool resolver
 	// Unmarshal devfile content into devfile struct
 	err = json.Unmarshal(d.Ctx.GetDevfileContent(), &d.Data)
 	if err != nil {
-		return d, errors.Wrapf(err, "failed to decode devfile content")
+		return d, &errPkg.NonCompliantDevfile{Err: err.Error()}
 	}
 
 	if flattenedDevfile {
@@ -80,7 +82,10 @@ func parseDevfile(d DevfileObj, resolveCtx *resolutionContextTree, tool resolver
 // ParserArgs is the struct to pass into parser functions which contains required info for parsing devfile.
 // It accepts devfile path, devfile URL or devfile content in []byte format.
 type ParserArgs struct {
-	// Path is a relative or absolute devfile path.
+	// Path is a relative or absolute devfile path on disk.
+	// It can also be a relative or absolute path to a folder containing one or more devfiles,
+	// in which case the library will try to pick an existing one, based on the following priority order:
+	// devfile.yaml > .devfile.yaml > devfile.yml > .devfile.yml
 	Path string
 	// URL is the URL address of the specific devfile.
 	URL string
@@ -95,6 +100,8 @@ type ParserArgs struct {
 	// RegistryURLs is a list of registry hosts which parser should pull parent devfile from.
 	// If registryUrl is defined in devfile, this list will be ignored.
 	RegistryURLs []string
+	// Token is a GitHub, GitLab, or Bitbucket personal access token used with a private git repo URL
+	Token string
 	// DefaultNamespace is the default namespace to use
 	// If namespace is defined under devfile's parent kubernetes object, this namespace will be ignored.
 	DefaultNamespace string
@@ -106,30 +113,80 @@ type ParserArgs struct {
 	ExternalVariables map[string]string
 	// HTTPTimeout overrides the request and response timeout values for reading a parent devfile reference from the registry.  If a negative value is specified, the default timeout will be used.
 	HTTPTimeout *int
+	// SetBooleanDefaults sets the boolean properties to their default values after a devfile been parsed.
+	// The value is true by default.  Clients can set this to false if they want to set the boolean properties themselves
+	SetBooleanDefaults *bool
+	// ImageNamesAsSelector sets the information that will be used to handle image names as selectors when parsing the Devfile.
+	// Not setting this field or setting it to nil disables the logic of handling image names as selectors.
+	ImageNamesAsSelector *ImageSelectorArgs
+	// DownloadGitResources downloads the resources from Git repository if true
+	DownloadGitResources *bool
+	// DevfileUtilsClient exposes the interface for mock implementation.
+	DevfileUtilsClient parserUtil.DevfileUtils
+}
+
+// ImageSelectorArgs defines the structure to leverage for using image names as selectors after parsing the Devfile.
+// The fields defined here will be used together to compute the final image names that will be built and pushed,
+// and replaced in all matching Image, Container or Kubernetes/OpenShift components.
+//
+// For Kubernetes/OpenShift components, replacement is done only in core Kubernetes resources
+// (CronJob, DaemonSet, Deployment, Job, Pod, ReplicaSet, ReplicationController, StatefulSet) that are *inlined* in those components.
+// Resources referenced via URIs will not be resolved. So you may want to also set ConvertKubernetesContentInUri to true in the parser args.
+//
+// For example, if Registry is set to "<local-registry>/<user-org>" and Tag is set to "some-dynamic-unique-tag",
+// all container and Kubernetes/OpenShift components matching a relative image name (say "my-image-name") of an Image component
+// will be replaced in the resulting Devfile by: "<local-registry>/<user-org>/<devfile-name>-my-image-name:some-dynamic-unique-tag".
+type ImageSelectorArgs struct {
+	// Registry is the registry base path under which images matching selectors will be built and pushed to. Required.
+	//
+	// Example: <local-registry>/<user-org>
+	Registry string
+	// Tag represents a tag identifier under which images matching selectors will be built and pushed to.
+	// This should ideally be set to a unique identifier for each run of the caller tool.
+	Tag string
 }
 
 // ParseDevfile func populates the devfile data, parses and validates the devfile integrity.
 // Creates devfile context and runtime objects
 func ParseDevfile(args ParserArgs) (d DevfileObj, err error) {
+	if args.ImageNamesAsSelector != nil && strings.TrimSpace(args.ImageNamesAsSelector.Registry) == "" {
+		return DevfileObj{}, errors.New("registry is mandatory when setting ImageNamesAsSelector in the parser args")
+	}
+
 	if args.Data != nil {
 		d.Ctx, err = devfileCtx.NewByteContentDevfileCtx(args.Data)
 		if err != nil {
-			return d, errors.Wrap(err, "failed to set devfile content from bytes")
+			return d, err
 		}
 	} else if args.Path != "" {
 		d.Ctx = devfileCtx.NewDevfileCtx(args.Path)
 	} else if args.URL != "" {
 		d.Ctx = devfileCtx.NewURLDevfileCtx(args.URL)
 	} else {
-		return d, errors.Wrap(err, "the devfile source is not provided")
+		return d, fmt.Errorf("the devfile source is not provided")
+	}
+
+	if args.Token != "" {
+		d.Ctx.SetToken(args.Token)
+	}
+
+	if args.DevfileUtilsClient == nil {
+		args.DevfileUtilsClient = parserUtil.NewDevfileUtilsClient()
+	}
+
+	downloadGitResources := true
+	if args.DownloadGitResources != nil {
+		downloadGitResources = *args.DownloadGitResources
 	}
 
 	tool := resolverTools{
-		defaultNamespace: args.DefaultNamespace,
-		registryURLs:     args.RegistryURLs,
-		context:          args.Context,
-		k8sClient:        args.K8sClient,
-		httpTimeout:      args.HTTPTimeout,
+		defaultNamespace:     args.DefaultNamespace,
+		registryURLs:         args.RegistryURLs,
+		context:              args.Context,
+		k8sClient:            args.K8sClient,
+		httpTimeout:          args.HTTPTimeout,
+		downloadGitResources: downloadGitResources,
+		devfileUtilsClient:   args.DevfileUtilsClient,
 	}
 
 	flattenedDevfile := true
@@ -139,12 +196,16 @@ func ParseDevfile(args ParserArgs) (d DevfileObj, err error) {
 
 	d, err = populateAndParseDevfile(d, &resolutionContextTree{}, tool, flattenedDevfile)
 	if err != nil {
-		return d, errors.Wrap(err, "failed to populateAndParseDevfile")
+		return d, err
 	}
 
-	//set defaults only if we are flattening parent and parsing succeeded
-	if flattenedDevfile && err == nil {
-		err = setDefaults(d)
+	setBooleanDefaults := true
+	if args.SetBooleanDefaults != nil {
+		setBooleanDefaults = *args.SetBooleanDefaults
+	}
+	//set defaults only if parsing succeeded
+	if err == nil && setBooleanDefaults {
+		err := setDefaults(d)
 		if err != nil {
 			return d, errors.Wrap(err, "failed to setDefaults")
 		}
@@ -157,9 +218,9 @@ func ParseDevfile(args ParserArgs) (d DevfileObj, err error) {
 
 	if convertUriToInlined {
 		d.Ctx.SetConvertUriToInlined(true)
-		err = parseKubeResourceFromURI(d)
+		err = parseKubeResourceFromURI(d, tool.devfileUtilsClient)
 		if err != nil {
-			return d, errors.Wrapf(err, "failed to parse kubernetes/openshift component from uri to inlined")
+			return d, err
 		}
 	}
 
@@ -179,20 +240,24 @@ type resolverTools struct {
 	k8sClient client.Client
 	// httpTimeout is the timeout value in seconds passed in from the client.
 	httpTimeout *int
+	// downloadGitResources downloads the resources from Git repository if true
+	downloadGitResources bool
+	// devfileUtilsClient exposes the Git Interface to be able to use mock implementation.
+	devfileUtilsClient parserUtil.DevfileUtils
 }
 
 func populateAndParseDevfile(d DevfileObj, resolveCtx *resolutionContextTree, tool resolverTools, flattenedDevfile bool) (DevfileObj, error) {
 	var err error
 	if err = resolveCtx.hasCycle(); err != nil {
-		return DevfileObj{}, err
+		return DevfileObj{}, &errPkg.NonCompliantDevfile{Err: err.Error()}
 	}
 	// Fill the fields of DevfileCtx struct
 	if d.Ctx.GetURL() != "" {
-		err = d.Ctx.PopulateFromURL()
+		err = d.Ctx.PopulateFromURL(tool.devfileUtilsClient)
 	} else if d.Ctx.GetDevfileContent() != nil {
 		err = d.Ctx.PopulateFromRaw()
 	} else {
-		err = d.Ctx.Populate()
+		err = d.Ctx.Populate(tool.devfileUtilsClient)
 	}
 	if err != nil {
 		return d, err
@@ -265,7 +330,7 @@ func parseParentAndPlugin(d DevfileObj, resolveCtx *resolutionContextTree, tool 
 			case parent.Kubernetes != nil:
 				parentDevfileObj, err = parseFromKubeCRD(parent.ImportReference, resolveCtx, tool)
 			default:
-				return fmt.Errorf("devfile parent does not define any resources")
+				err = &errPkg.NonCompliantDevfile{Err: "devfile parent does not define any resources"}
 			}
 			if err != nil {
 				return err
@@ -280,8 +345,9 @@ func parseParentAndPlugin(d DevfileObj, resolveCtx *resolutionContextTree, tool 
 				if err != nil {
 					return fmt.Errorf("fail to parse version of parent devfile from: %v", resolveImportReference(parent.ImportReference))
 				}
+
 				if parentDevfileVerson.GreaterThan(mainDevfileVersion) {
-					return fmt.Errorf("the parent devfile version from %v is greater than the child devfile version from %v", resolveImportReference(parent.ImportReference), resolveImportReference(resolveCtx.importReference))
+					return &errPkg.NonCompliantDevfile{Err: fmt.Sprintf("the parent devfile version from %v is greater than the child devfile version from %v", resolveImportReference(parent.ImportReference), resolveImportReference(resolveCtx.importReference))}
 				}
 			}
 			parentWorkspaceContent := parentDevfileObj.Data.GetDevfileWorkspaceSpecContent()
@@ -326,7 +392,7 @@ func parseParentAndPlugin(d DevfileObj, resolveCtx *resolutionContextTree, tool 
 			case plugin.Kubernetes != nil:
 				pluginDevfileObj, err = parseFromKubeCRD(plugin.ImportReference, resolveCtx, tool)
 			default:
-				return fmt.Errorf("plugin %s does not define any resources", component.Name)
+				err = &errPkg.NonCompliantDevfile{Err: fmt.Sprintf("plugin %s does not define any resources", component.Name)}
 			}
 			if err != nil {
 				return err
@@ -342,7 +408,7 @@ func parseParentAndPlugin(d DevfileObj, resolveCtx *resolutionContextTree, tool 
 					return fmt.Errorf("fail to parse version of plugin devfile from: %v", resolveImportReference(component.Plugin.ImportReference))
 				}
 				if pluginDevfileVerson.GreaterThan(mainDevfileVersion) {
-					return fmt.Errorf("the plugin devfile version from %v is greater than the child devfile version from %v", resolveImportReference(component.Plugin.ImportReference), resolveImportReference(resolveCtx.importReference))
+					return &errPkg.NonCompliantDevfile{Err: fmt.Sprintf("the plugin devfile version from %v is greater than the child devfile version from %v", resolveImportReference(component.Plugin.ImportReference), resolveImportReference(resolveCtx.importReference))}
 				}
 			}
 			pluginWorkspaceContent := pluginDevfileObj.Data.GetDevfileWorkspaceSpecContent()
@@ -396,7 +462,7 @@ func parseFromURI(importReference v1.ImportReference, curDevfileCtx devfileCtx.D
 		newUri = path.Join(path.Dir(curDevfileCtx.GetAbsPath()), uri)
 		d.Ctx = devfileCtx.NewDevfileCtx(newUri)
 		if util.ValidateFile(newUri) != nil {
-			return DevfileObj{}, fmt.Errorf("the provided path is not a valid filepath %s", newUri)
+			return DevfileObj{}, &errPkg.NonCompliantDevfile{Err: fmt.Sprintf("the provided path is not a valid filepath %s", newUri)}
 		}
 		srcDir := path.Dir(newUri)
 		destDir := path.Dir(curDevfileCtx.GetAbsPath())
@@ -422,14 +488,15 @@ func parseFromURI(importReference v1.ImportReference, curDevfileCtx devfileCtx.D
 			return DevfileObj{}, fmt.Errorf("failed to resolve parent uri, devfile context is missing absolute url and path to devfile. %s", resolveImportReference(importReference))
 		}
 
+		token := curDevfileCtx.GetToken()
 		d.Ctx = devfileCtx.NewURLDevfileCtx(newUri)
-		if strings.Contains(newUri, "raw.githubusercontent.com") {
-			urlComponents, err := util.GetGitUrlComponentsFromRaw(newUri)
-			if err != nil {
-				return DevfileObj{}, err
-			}
+		if token != "" {
+			d.Ctx.SetToken(token)
+		}
+
+		if tool.downloadGitResources {
 			destDir := path.Dir(curDevfileCtx.GetAbsPath())
-			err = getResourcesFromGit(urlComponents, destDir)
+			err = tool.devfileUtilsClient.DownloadGitRepoResources(newUri, destDir, token)
 			if err != nil {
 				return DevfileObj{}, err
 			}
@@ -439,27 +506,6 @@ func parseFromURI(importReference v1.ImportReference, curDevfileCtx devfileCtx.D
 	newResolveCtx := resolveCtx.appendNode(importReference)
 
 	return populateAndParseDevfile(d, newResolveCtx, tool, true)
-}
-
-func getResourcesFromGit(gitUrlComponents map[string]string, destDir string) error {
-	stackDir, err := ioutil.TempDir(os.TempDir(), fmt.Sprintf("git-resources"))
-	if err != nil {
-		return fmt.Errorf("failed to create dir: %s, error: %v", stackDir, err)
-	}
-	defer os.RemoveAll(stackDir)
-
-	err = util.CloneGitRepo(gitUrlComponents, stackDir)
-	if err != nil {
-		return err
-	}
-
-	dir := path.Dir(path.Join(stackDir, gitUrlComponents["file"]))
-	err = util.CopyAllDirFiles(dir, destDir)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func parseFromRegistry(importReference v1.ImportReference, resolveCtx *resolutionContextTree, tool resolverTools) (d DevfileObj, err error) {
@@ -474,7 +520,7 @@ func parseFromRegistry(importReference v1.ImportReference, resolveCtx *resolutio
 		}
 		d.Ctx, err = devfileCtx.NewByteContentDevfileCtx(devfileContent)
 		if err != nil {
-			return d, errors.Wrap(err, "failed to set devfile content from bytes")
+			return d, err
 		}
 		newResolveCtx := resolveCtx.appendNode(importReference)
 
@@ -505,7 +551,7 @@ func parseFromRegistry(importReference v1.ImportReference, resolveCtx *resolutio
 			}
 		}
 	} else {
-		return DevfileObj{}, fmt.Errorf("failed to fetch from registry, registry URL is not provided")
+		return DevfileObj{}, &errPkg.NonCompliantDevfile{Err: "failed to fetch from registry, registry URL is not provided"}
 	}
 
 	return DevfileObj{}, fmt.Errorf("failed to get id: %s from registry URLs provided", id)
@@ -513,25 +559,26 @@ func parseFromRegistry(importReference v1.ImportReference, resolveCtx *resolutio
 
 func getDevfileFromRegistry(id, registryURL, version string, httpTimeout *int) ([]byte, error) {
 	if !strings.HasPrefix(registryURL, "http://") && !strings.HasPrefix(registryURL, "https://") {
-		return nil, fmt.Errorf("the provided registryURL: %s is not a valid URL", registryURL)
+		return nil, &errPkg.NonCompliantDevfile{Err: fmt.Sprintf("the provided registryURL: %s is not a valid URL", registryURL)}
 	}
 	param := util.HTTPRequestParams{
 		URL: fmt.Sprintf("%s/devfiles/%s/%s", registryURL, id, version),
 	}
 
 	param.Timeout = httpTimeout
-
+	//suppress telemetry for parent uri references
+	param.TelemetryClientName = util.TelemetryIndirectDevfileCall
 	return util.HTTPGetRequest(param, 0)
 }
 
 func getResourcesFromRegistry(id, registryURL, destDir string) error {
-	stackDir, err := ioutil.TempDir(os.TempDir(), fmt.Sprintf("registry-resources-%s", id))
+	stackDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("registry-resources-%s", id))
 	if err != nil {
 		return fmt.Errorf("failed to create dir: %s, error: %v", stackDir, err)
 	}
 	defer os.RemoveAll(stackDir)
-
-	err = registryLibrary.PullStackFromRegistry(registryURL, id, stackDir, registryLibrary.RegistryOptions{})
+	//suppress telemetry for downloading resources from parent reference
+	err = registryLibrary.PullStackFromRegistry(registryURL, id, stackDir, registryLibrary.RegistryOptions{Telemetry: registryLibrary.TelemetryData{Client: util.TelemetryIndirectDevfileCall}})
 	if err != nil {
 		return fmt.Errorf("failed to pull stack from registry %s", registryURL)
 	}
@@ -547,7 +594,7 @@ func getResourcesFromRegistry(id, registryURL, destDir string) error {
 func parseFromKubeCRD(importReference v1.ImportReference, resolveCtx *resolutionContextTree, tool resolverTools) (d DevfileObj, err error) {
 
 	if tool.k8sClient == nil || tool.context == nil {
-		return DevfileObj{}, fmt.Errorf("Kubernetes client and context are required to parse from Kubernetes CRD")
+		return DevfileObj{}, fmt.Errorf("kubernetes client and context are required to parse from Kubernetes CRD")
 	}
 	namespace := importReference.Kubernetes.Namespace
 
@@ -605,7 +652,7 @@ func convertDevWorskapceTemplateToDevObj(dwTemplate v1.DevWorkspaceTemplate) (d 
 
 }
 
-//setDefaults sets the default values for nil boolean properties after the merging of devWorkspaceTemplateSpec is complete
+// setDefaults sets the default values for nil boolean properties after the merging of devWorkspaceTemplateSpec is complete
 func setDefaults(d DevfileObj) (err error) {
 
 	var devfileVersion string
@@ -706,13 +753,13 @@ func setDefaults(d DevfileObj) (err error) {
 	return nil
 }
 
-///setIsDefault sets the default value of CommandGroup.IsDefault if nil
+// setIsDefault sets the default value of CommandGroup.IsDefault if nil
 func setIsDefault(cmdGroup *v1.CommandGroup) {
 	val := cmdGroup.GetIsDefault()
 	cmdGroup.IsDefault = &val
 }
 
-//setEndpoints sets the default value of Endpoint.Secure if nil
+// setEndpoints sets the default value of Endpoint.Secure if nil
 func setEndpoints(endpoints []v1.Endpoint) {
 	for i := range endpoints {
 		val := endpoints[i].GetSecure()
@@ -720,8 +767,8 @@ func setEndpoints(endpoints []v1.Endpoint) {
 	}
 }
 
-//parseKubeResourceFromURI iterate through all kubernetes & openshift components, and parse from uri and update the content to inlined field in devfileObj
-func parseKubeResourceFromURI(devObj DevfileObj) error {
+// parseKubeResourceFromURI iterate through all kubernetes & openshift components, and parse from uri and update the content to inlined field in devfileObj
+func parseKubeResourceFromURI(devObj DevfileObj, devfileUtilsClient parserUtil.DevfileUtils) error {
 	getKubeCompOptions := common.DevfileOptions{
 		ComponentOptions: common.ComponentOptions{
 			ComponentType: v1.KubernetesComponentType,
@@ -743,9 +790,9 @@ func parseKubeResourceFromURI(devObj DevfileObj) error {
 	for _, kubeComp := range kubeComponents {
 		if kubeComp.Kubernetes != nil && kubeComp.Kubernetes.Uri != "" {
 			/* #nosec G601 -- not an issue, kubeComp is de-referenced in sequence*/
-			err := convertK8sLikeCompUriToInlined(&kubeComp, devObj.Ctx)
+			err := convertK8sLikeCompUriToInlined(&kubeComp, devObj.Ctx, devfileUtilsClient)
 			if err != nil {
-				return errors.Wrapf(err, "failed to convert Kubernetes Uri to inlined for component '%s'", kubeComp.Name)
+				return errors.Wrapf(err, "failed to convert kubernetes uri to inlined for component '%s'", kubeComp.Name)
 			}
 			err = devObj.Data.UpdateComponent(kubeComp)
 			if err != nil {
@@ -756,9 +803,9 @@ func parseKubeResourceFromURI(devObj DevfileObj) error {
 	for _, openshiftComp := range openshiftComponents {
 		if openshiftComp.Openshift != nil && openshiftComp.Openshift.Uri != "" {
 			/* #nosec G601 -- not an issue, openshiftComp is de-referenced in sequence*/
-			err := convertK8sLikeCompUriToInlined(&openshiftComp, devObj.Ctx)
+			err := convertK8sLikeCompUriToInlined(&openshiftComp, devObj.Ctx, devfileUtilsClient)
 			if err != nil {
-				return errors.Wrapf(err, "failed to convert Openshift Uri to inlined for component '%s'", openshiftComp.Name)
+				return errors.Wrapf(err, "failed to convert openshift uri to inlined for component '%s'", openshiftComp.Name)
 			}
 			err = devObj.Data.UpdateComponent(openshiftComp)
 			if err != nil {
@@ -769,15 +816,15 @@ func parseKubeResourceFromURI(devObj DevfileObj) error {
 	return nil
 }
 
-//convertK8sLikeCompUriToInlined read in kubernetes resources definition from uri and converts to kubernetest inlined field
-func convertK8sLikeCompUriToInlined(component *v1.Component, d devfileCtx.DevfileCtx) error {
+// convertK8sLikeCompUriToInlined read in kubernetes resources definition from uri and converts to kubernetest inlined field
+func convertK8sLikeCompUriToInlined(component *v1.Component, d devfileCtx.DevfileCtx, devfileUtilsClient parserUtil.DevfileUtils) error {
 	var uri string
 	if component.Kubernetes != nil {
 		uri = component.Kubernetes.Uri
 	} else if component.Openshift != nil {
 		uri = component.Openshift.Uri
 	}
-	data, err := getKubernetesDefinitionFromUri(uri, d)
+	data, err := getKubernetesDefinitionFromUri(uri, d, devfileUtilsClient)
 	if err != nil {
 		return err
 	}
@@ -796,8 +843,8 @@ func convertK8sLikeCompUriToInlined(component *v1.Component, d devfileCtx.Devfil
 	return nil
 }
 
-//getKubernetesDefinitionFromUri read in kubernetes resources definition from uri and returns the raw content
-func getKubernetesDefinitionFromUri(uri string, d devfileCtx.DevfileCtx) ([]byte, error) {
+// getKubernetesDefinitionFromUri read in kubernetes resources definition from uri and returns the raw content
+func getKubernetesDefinitionFromUri(uri string, d devfileCtx.DevfileCtx, devfileUtilsClient parserUtil.DevfileUtils) ([]byte, error) {
 	// validate URI
 	err := validation.ValidateURI(uri)
 	if err != nil {
@@ -828,10 +875,16 @@ func getKubernetesDefinitionFromUri(uri string, d devfileCtx.DevfileCtx) ([]byte
 			// absolute URL address
 			newUri = uri
 		}
-		data, err = util.DownloadFileInMemory(newUri)
-		if err != nil {
-			return nil, errors.Wrapf(err, "error getting kubernetes resources definition info from url '%s'", newUri)
+		params := util.HTTPRequestParams{URL: newUri}
+		if d.GetToken() != "" {
+			params.Token = d.GetToken()
 		}
+		data, err = devfileUtilsClient.DownloadInMemory(params)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error getting kubernetes resources definition information")
+		}
+	} else {
+		return nil, fmt.Errorf("error getting kubernetes resources definition information, unable to resolve the file uri: %v", uri)
 	}
 	return data, nil
 }

@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,12 +27,12 @@ import (
 	schema "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	header "github.com/devfile/api/v2/pkg/devfile"
 	commonUtils "github.com/devfile/api/v2/test/v200/utils/common"
-	devfilepkg "github.com/devfile/library/pkg/devfile"
-	"github.com/devfile/library/pkg/devfile/parser"
-	devfileCtx "github.com/devfile/library/pkg/devfile/parser/context"
-	devfileData "github.com/devfile/library/pkg/devfile/parser/data"
-	"github.com/devfile/library/pkg/devfile/parser/data/v2/common"
-	"github.com/devfile/library/pkg/util"
+	devfilepkg "github.com/devfile/library/v2/pkg/devfile"
+	"github.com/devfile/library/v2/pkg/devfile/parser"
+	devfileCtx "github.com/devfile/library/v2/pkg/devfile/parser/context"
+	devfileData "github.com/devfile/library/v2/pkg/devfile/parser/data"
+	"github.com/devfile/library/v2/pkg/devfile/parser/data/v2/common"
+	"github.com/devfile/library/v2/pkg/util"
 )
 
 const (
@@ -50,7 +50,7 @@ type DevfileValidator struct{}
 
 var parserArgs = parser.ParserArgs{}
 
-//directory where test devfiles are generated and/or copied
+// directory where test devfiles are generated and/or copied
 const destDir = "tmp/library_test/"
 
 // WriteAndValidate implements DevfileValidator interface.
@@ -305,8 +305,8 @@ func CopyDevfileSamples(t *testing.T, testDevfiles []string) {
 	}
 }
 
-//duplicateDevfileSample: Makes a copy of the parent devfile test artifact that is expected to exist in the tmp/library_test directory.
-//This is used in the multi-threaded parent test scenarios
+// duplicateDevfileSample: Makes a copy of the parent devfile test artifact that is expected to exist in the tmp/library_test directory.
+// This is used in the multi-threaded parent test scenarios
 func duplicateDevfileSample(t *testing.T, src string, dst string) {
 	srcPath := destDir + src
 	destPath := destDir + dst
@@ -376,7 +376,7 @@ func RunTest(testContent commonUtils.TestContent, t *testing.T) {
 	}
 }
 
-//RunStaticTest : Runs fixed tests based on pre-existing artifacts
+// RunStaticTest : Runs fixed tests based on pre-existing artifacts
 func RunStaticTest(testContent commonUtils.TestContent, t *testing.T) {
 	commonUtils.LogMessage(fmt.Sprintf("Start test for %s", testContent.FileName))
 	follower := DevfileFollower{}

@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,12 @@ import (
 	devfilepkg "github.com/devfile/api/v2/pkg/devfile"
 )
 
-//GetSchemaVersion gets devfile schema version
+// GetSchemaVersion gets devfile schema version
 func (d *DevfileV2) GetSchemaVersion() string {
 	return d.SchemaVersion
 }
 
-//SetSchemaVersion sets devfile schema version
+// SetSchemaVersion sets devfile schema version
 func (d *DevfileV2) SetSchemaVersion(version string) {
 	d.SchemaVersion = version
 }

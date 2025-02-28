@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,10 +18,13 @@ package data
 import (
 	"reflect"
 
-	v2 "github.com/devfile/library/pkg/devfile/parser/data/v2"
-	v200 "github.com/devfile/library/pkg/devfile/parser/data/v2/2.0.0"
-	v210 "github.com/devfile/library/pkg/devfile/parser/data/v2/2.1.0"
-	v220 "github.com/devfile/library/pkg/devfile/parser/data/v2/2.2.0"
+	v2 "github.com/devfile/library/v2/pkg/devfile/parser/data/v2"
+	v200 "github.com/devfile/library/v2/pkg/devfile/parser/data/v2/2.0.0"
+	v210 "github.com/devfile/library/v2/pkg/devfile/parser/data/v2/2.1.0"
+	v220 "github.com/devfile/library/v2/pkg/devfile/parser/data/v2/2.2.0"
+	v221 "github.com/devfile/library/v2/pkg/devfile/parser/data/v2/2.2.1"
+	v222 "github.com/devfile/library/v2/pkg/devfile/parser/data/v2/2.2.2"
+	v230 "github.com/devfile/library/v2/pkg/devfile/parser/data/v2/2.3.0"
 )
 
 // SupportedApiVersions stores the supported devfile API versions
@@ -32,6 +35,9 @@ const (
 	APISchemaVersion200 supportedApiVersion = "2.0.0"
 	APISchemaVersion210 supportedApiVersion = "2.1.0"
 	APISchemaVersion220 supportedApiVersion = "2.2.0"
+	APISchemaVersion221 supportedApiVersion = "2.2.1"
+	APISchemaVersion222 supportedApiVersion = "2.2.2"
+	APISchemaVersion230 supportedApiVersion = "2.3.0"
 	APIVersionAlpha2    supportedApiVersion = "v1alpha2"
 )
 
@@ -46,6 +52,9 @@ func init() {
 	apiVersionToDevfileStruct[APISchemaVersion200] = reflect.TypeOf(v2.DevfileV2{})
 	apiVersionToDevfileStruct[APISchemaVersion210] = reflect.TypeOf(v2.DevfileV2{})
 	apiVersionToDevfileStruct[APISchemaVersion220] = reflect.TypeOf(v2.DevfileV2{})
+	apiVersionToDevfileStruct[APISchemaVersion221] = reflect.TypeOf(v2.DevfileV2{})
+	apiVersionToDevfileStruct[APISchemaVersion222] = reflect.TypeOf(v2.DevfileV2{})
+	apiVersionToDevfileStruct[APISchemaVersion230] = reflect.TypeOf(v2.DevfileV2{})
 	apiVersionToDevfileStruct[APIVersionAlpha2] = reflect.TypeOf(v2.DevfileV2{})
 }
 
@@ -58,6 +67,9 @@ func init() {
 	devfileApiVersionToJSONSchema[APISchemaVersion200] = v200.JsonSchema200
 	devfileApiVersionToJSONSchema[APISchemaVersion210] = v210.JsonSchema210
 	devfileApiVersionToJSONSchema[APISchemaVersion220] = v220.JsonSchema220
+	devfileApiVersionToJSONSchema[APISchemaVersion221] = v221.JsonSchema221
+	devfileApiVersionToJSONSchema[APISchemaVersion222] = v222.JsonSchema222
+	devfileApiVersionToJSONSchema[APISchemaVersion230] = v230.JsonSchema230
 	// should use hightest v2 schema version since it is expected to be backward compatible with the same api version
-	devfileApiVersionToJSONSchema[APIVersionAlpha2] = v220.JsonSchema220
+	devfileApiVersionToJSONSchema[APIVersionAlpha2] = v230.JsonSchema230
 }

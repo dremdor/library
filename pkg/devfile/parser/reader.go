@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/devfile/library/pkg/util"
+	errPkg "github.com/devfile/library/v2/pkg/devfile/parser/errors"
+	parserUtil "github.com/devfile/library/v2/pkg/devfile/parser/util"
+	"github.com/devfile/library/v2/pkg/util"
 	"github.com/pkg/errors"
 	"github.com/spf13/afero"
 	"gopkg.in/yaml.v3"
@@ -29,7 +31,7 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	extensionsv1 "k8s.io/api/extensions/v1beta1"
+	networkingv1 "k8s.io/api/networking/v1"
 )
 
 // YamlSrc specifies the src of the yaml in either Path, URL or Data format
@@ -38,6 +40,8 @@ type YamlSrc struct {
 	Path string
 	// URL of the yaml file
 	URL string
+	// Token to access a private URL like a private repository
+	Token string
 	// Data is the yaml content in []byte format
 	Data []byte
 }
@@ -48,21 +52,28 @@ type KubernetesResources struct {
 	Deployments []appsv1.Deployment
 	Services    []corev1.Service
 	Routes      []routev1.Route
-	Ingresses   []extensionsv1.Ingress
+	Ingresses   []networkingv1.Ingress
+	Others      []interface{}
 }
 
 // ReadKubernetesYaml reads a yaml Kubernetes file from either the Path, URL or Data provided.
 // It returns all the parsed Kubernetes objects as an array of interface.
 // Consumers interested in the Kubernetes resources are expected to Unmarshal
 // it to the struct of the respective Kubernetes resource. If a Path is being passed,
-// provide a filesystem, otherwise nil can be passed in
-func ReadKubernetesYaml(src YamlSrc, fs *afero.Afero) ([]interface{}, error) {
+// provide a filesystem, otherwise nil can be passed in.
+// Pass in an optional client to use either the actual implementation or a mock implementation of the interface.
+func ReadKubernetesYaml(src YamlSrc, fs *afero.Afero, devfileUtilsClient parserUtil.DevfileUtils) ([]interface{}, error) {
 
 	var data []byte
 	var err error
 
 	if src.URL != "" {
-		data, err = util.DownloadFileInMemory(src.URL)
+		if devfileUtilsClient == nil {
+			devfileUtilsClient = parserUtil.NewDevfileUtilsClient()
+		}
+
+		params := util.HTTPRequestParams{URL: src.URL, Token: src.Token}
+		data, err = devfileUtilsClient.DownloadInMemory(params)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to download file %q", src.URL)
 		}
@@ -104,20 +115,26 @@ func ParseKubernetesYaml(values []interface{}) (KubernetesResources, error) {
 	var deployments []appsv1.Deployment
 	var services []corev1.Service
 	var routes []routev1.Route
-	var ingresses []extensionsv1.Ingress
+	var ingresses []networkingv1.Ingress
+	var otherResources []interface{}
 
 	for _, value := range values {
 		var deployment appsv1.Deployment
 		var service corev1.Service
 		var route routev1.Route
-		var ingress extensionsv1.Ingress
+		var ingress networkingv1.Ingress
+		var otherResource interface{}
 
 		byteData, err := k8yaml.Marshal(value)
 		if err != nil {
 			return KubernetesResources{}, err
 		}
 
-		kubernetesMap := value.(map[string]interface{})
+		var kubernetesMap map[string]interface{}
+		err = k8yaml.Unmarshal(byteData, &kubernetesMap)
+		if err != nil {
+			return KubernetesResources{}, &errPkg.NonCompliantDevfile{Err: err.Error()}
+		}
 		kind := kubernetesMap["kind"]
 
 		switch kind {
@@ -133,10 +150,13 @@ func ParseKubernetesYaml(values []interface{}) (KubernetesResources, error) {
 		case "Ingress":
 			err = k8yaml.Unmarshal(byteData, &ingress)
 			ingresses = append(ingresses, ingress)
+		default:
+			err = k8yaml.Unmarshal(byteData, &otherResource)
+			otherResources = append(otherResources, otherResource)
 		}
 
 		if err != nil {
-			return KubernetesResources{}, err
+			return KubernetesResources{}, &errPkg.NonCompliantDevfile{Err: err.Error()}
 		}
 	}
 
@@ -145,5 +165,6 @@ func ParseKubernetesYaml(values []interface{}) (KubernetesResources, error) {
 		Services:    services,
 		Routes:      routes,
 		Ingresses:   ingresses,
+		Others:      otherResources,
 	}, nil
 }

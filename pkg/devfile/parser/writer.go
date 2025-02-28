@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,15 +18,15 @@ package parser
 import (
 	v1 "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	apiAttributes "github.com/devfile/api/v2/pkg/attributes"
-	"github.com/devfile/library/pkg/devfile/parser/data/v2/common"
+	"github.com/devfile/library/v2/pkg/devfile/parser/data/v2/common"
 	"sigs.k8s.io/yaml"
 
-	"github.com/devfile/library/pkg/testingutil/filesystem"
+	"github.com/devfile/library/v2/pkg/testingutil/filesystem"
 	"github.com/pkg/errors"
 	"k8s.io/klog"
 )
 
-// WriteYamlDevfile creates a devfile.yaml file
+// WriteYamlDevfile writes the content of the Devfile data to its absolute path on the filesystem.
 func (d *DevfileObj) WriteYamlDevfile() error {
 
 	// Check kubernetes components, and restore original uri content
@@ -41,7 +41,7 @@ func (d *DevfileObj) WriteYamlDevfile() error {
 	if err != nil {
 		return errors.Wrapf(err, "failed to marshal devfile object into yaml")
 	}
-	// Write to devfile.yaml
+	// Write to the absolute path
 	fs := d.Ctx.GetFs()
 	if fs == nil {
 		fs = filesystem.DefaultFs{}
@@ -52,7 +52,7 @@ func (d *DevfileObj) WriteYamlDevfile() error {
 	}
 
 	// Successful
-	klog.V(2).Infof("devfile yaml created at: '%s'", OutputDevfileYamlPath)
+	klog.V(2).Infof("devfile written to: '%s'", d.Ctx.GetAbsPath())
 	return nil
 }
 

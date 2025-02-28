@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,11 @@
 package parser
 
 import (
-	"fmt"
 	"net/url"
-	"os"
-	"path/filepath"
-	"strings"
 
-	"github.com/devfile/library/pkg/testingutil/filesystem"
-	"github.com/devfile/library/pkg/util"
+	parserUtil "github.com/devfile/library/v2/pkg/devfile/parser/util"
+	"github.com/devfile/library/v2/pkg/testingutil/filesystem"
+	"github.com/devfile/library/v2/pkg/util"
 	"k8s.io/klog"
 )
 
@@ -36,7 +33,10 @@ type DevfileCtx struct {
 	// absolute path of devfile
 	absPath string
 
-	// relative path of devfile
+	// relative path of devfile.
+	// It can also be a relative or absolute path to a folder containing one or more devfiles,
+	// in which case the library will try to pick an existing one, based on the following priority order:
+	// devfile.yaml > .devfile.yaml > devfile.yml > .devfile.yml
 	relPath string
 
 	// raw content of the devfile
@@ -45,13 +45,16 @@ type DevfileCtx struct {
 	// devfile json schema
 	jsonSchema string
 
-	//url path of the devfile
+	// url path of the devfile
 	url string
+
+	// token is a personal access token used with a private git repo URL
+	token string
 
 	// filesystem for devfile
 	fs filesystem.Filesystem
 
-	// devfile kubernetes components has been coverted from uri to inlined in memory
+	// devfile kubernetes components has been converted from uri to inlined in memory
 	convertUriToInlined bool
 }
 
@@ -92,37 +95,30 @@ func (d *DevfileCtx) populateDevfile() (err error) {
 }
 
 // Populate fills the DevfileCtx struct with relevant context info
-func (d *DevfileCtx) Populate() (err error) {
-	if !strings.HasSuffix(d.relPath, ".yaml") {
-		if _, err := os.Stat(filepath.Join(d.relPath, "devfile.yaml")); os.IsNotExist(err) {
-			if _, err := os.Stat(filepath.Join(d.relPath, ".devfile.yaml")); os.IsNotExist(err) {
-				return fmt.Errorf("the provided path is not a valid yaml filepath, and devfile.yaml or .devfile.yaml not found in the provided path : %s", d.relPath)
-			} else {
-				d.relPath = filepath.Join(d.relPath, ".devfile.yaml")
-			}
-		} else {
-			d.relPath = filepath.Join(d.relPath, "devfile.yaml")
-		}
+func (d *DevfileCtx) Populate(devfileUtilsClient parserUtil.DevfileUtils) (err error) {
+	d.relPath, err = lookupDevfileFromPath(d.fs, d.relPath)
+	if err != nil {
+		return err
 	}
-	if err := d.SetAbsPath(); err != nil {
+	if err = d.SetAbsPath(); err != nil {
 		return err
 	}
 	klog.V(4).Infof("absolute devfile path: '%s'", d.absPath)
 	// Read and save devfile content
-	if err := d.SetDevfileContent(); err != nil {
+	if err = d.SetDevfileContent(devfileUtilsClient); err != nil {
 		return err
 	}
 	return d.populateDevfile()
 }
 
 // PopulateFromURL fills the DevfileCtx struct with relevant context info
-func (d *DevfileCtx) PopulateFromURL() (err error) {
+func (d *DevfileCtx) PopulateFromURL(devfileUtilsClient parserUtil.DevfileUtils) (err error) {
 	_, err = url.ParseRequestURI(d.url)
 	if err != nil {
 		return err
 	}
 	// Read and save devfile content
-	if err := d.SetDevfileContent(); err != nil {
+	if err := d.SetDevfileContent(devfileUtilsClient); err != nil {
 		return err
 	}
 	return d.populateDevfile()
@@ -148,6 +144,16 @@ func (d *DevfileCtx) GetAbsPath() string {
 // GetURL func returns current devfile absolute URL address
 func (d *DevfileCtx) GetURL() string {
 	return d.url
+}
+
+// GetToken func returns current devfile token
+func (d *DevfileCtx) GetToken() string {
+	return d.token
+}
+
+// SetToken sets the token for the devfile
+func (d *DevfileCtx) SetToken(token string) {
+	d.token = token
 }
 
 // SetAbsPath sets absolute file path for devfile

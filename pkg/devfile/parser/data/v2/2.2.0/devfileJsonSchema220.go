@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
 
 package version220
 
-// https://raw.githubusercontent.com/devfile/api/main/schemas/latest/devfile.json
+// https://raw.githubusercontent.com/devfile/api/v2.2.0/schemas/latest/devfile.json
 const JsonSchema220 = `{
   "description": "Devfile describes the structure of a cloud-native devworkspace and development environment.",
   "type": "object",
-  "title": "Devfile schema - Version 2.2.0-alpha",
+  "title": "Devfile schema - Version 2.2.0",
   "required": [
     "schemaVersion"
   ],

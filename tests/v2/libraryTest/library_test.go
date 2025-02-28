@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,9 +22,9 @@ import (
 	schema "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	"github.com/devfile/api/v2/pkg/attributes"
 	commonUtils "github.com/devfile/api/v2/test/v200/utils/common"
-	"github.com/devfile/library/pkg/devfile/parser"
-	"github.com/devfile/library/pkg/testingutil"
-	libraryUtils "github.com/devfile/library/tests/v2/utils/library"
+	"github.com/devfile/library/v2/pkg/devfile/parser"
+	"github.com/devfile/library/v2/pkg/testingutil"
+	libraryUtils "github.com/devfile/library/v2/tests/v2/utils/library"
 	kubev1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -268,7 +268,7 @@ func Test_v220_Devfile(t *testing.T) {
 
 }
 
-//Create kube client and context and set as ParserArgs for Parent Kubernetes reference test.  Corresponding main devfile is ../devfile/samples/TestParent_KubeCRD.yaml
+// Create kube client and context and set as ParserArgs for Parent Kubernetes reference test.  Corresponding main devfile is ../devfile/samples/TestParent_KubeCRD.yaml
 func setClientAndContextParserArgs() *parser.ParserArgs {
 	isTrue := true
 	name := "testkubeparent1"

@@ -1,5 +1,5 @@
 //
-// Copyright 2021-2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,6 @@ package util
 
 import (
 	"fmt"
-	"github.com/devfile/library/pkg/testingutil/filesystem"
-	"io/ioutil"
-	corev1 "k8s.io/api/core/v1"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +28,11 @@ import (
 	"runtime"
 	"strconv"
 	"testing"
+
+	"github.com/devfile/library/v2/pkg/testingutil/filesystem"
+	"github.com/kylelemons/godebug/pretty"
+	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestNamespaceOpenShiftObject(t *testing.T) {
@@ -851,6 +853,74 @@ func TestFilterIgnores(t *testing.T) {
 	}
 }
 
+func TestIsValidProjectDir(t *testing.T) {
+	const validProjectDirPath = "/projectDirs/validProjectDir"
+	const emptyProjectDirPath = "/projectDirs/emptyProjectDir"
+	const invalidProjectDirWithFiles = "/projectDirs/invalidProjectDirWithFiles"
+	const invalidProjectDirWithSubDirPath = "/projectDirs/invalidProjectDirWithSubDir"
+	fs := filesystem.NewFakeFs()
+	tests := []struct {
+		name             string
+		path             string
+		devfilePath      string
+		isDevfilePathDir bool
+		otherFiles       []string
+		wantErr          bool
+	}{
+		{
+			name:        "Case 1: Valid project directory",
+			path:        validProjectDirPath,
+			devfilePath: "devfile.yaml",
+		},
+		{
+			name: "Case 2: Valid empty project directory",
+			path: emptyProjectDirPath,
+		},
+		{
+			name:        "Case 3: Invalid project directory with files",
+			path:        invalidProjectDirWithFiles,
+			devfilePath: "devfile.yaml",
+			otherFiles:  []string{"package.json", "app.js"},
+			wantErr:     true,
+		},
+		{
+			name:             "Case 4: Invalid project directory with subdirectory",
+			path:             invalidProjectDirWithSubDirPath,
+			devfilePath:      "devfile",
+			isDevfilePathDir: true,
+			wantErr:          true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create test projectDir
+			fs.MkdirAll(tt.path, os.ModePerm)
+
+			// create devfile (or subdir)
+			if tt.devfilePath != "" {
+				if tt.isDevfilePathDir {
+					fs.MkdirAll(filepath.Join(tt.path, tt.devfilePath), os.ModePerm)
+				} else {
+					fs.Create(filepath.Join(tt.path, tt.devfilePath))
+				}
+			}
+
+			// create other files
+			for _, otherFile := range tt.otherFiles {
+				fs.Create(filepath.Join(tt.path, otherFile))
+			}
+
+			err := isValidProjectDirOnFS(tt.path, tt.devfilePath, fs)
+			if !tt.wantErr && err != nil {
+				t.Errorf("Got unexpected error: %v", err)
+			} else if tt.wantErr && err == nil {
+				t.Errorf("Expected an error but got nil")
+			}
+		})
+	}
+}
+
 func TestDownloadFile(t *testing.T) {
 	// Start a local HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -917,7 +987,7 @@ func TestDownloadFile(t *testing.T) {
 					t.Errorf("Failed to download file with error %s", err)
 				}
 
-				got, err := ioutil.ReadFile(tt.filepath)
+				got, err := os.ReadFile(tt.filepath)
 				if err != nil {
 					t.Errorf("Failed to read file with error %s", err)
 				}
@@ -931,6 +1001,71 @@ func TestDownloadFile(t *testing.T) {
 				if err != nil {
 					t.Errorf("Failed to delete file with error %s", err)
 				}
+			}
+		})
+	}
+}
+
+func TestDownloadInMemory(t *testing.T) {
+	const downloadErr = "failed to retrieve %s, 404: Not Found"
+	// Start a local HTTP server
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		// Send response to be tested
+		_, err := rw.Write([]byte("OK"))
+		if err != nil {
+			t.Error(err)
+		}
+	}))
+
+	// Close the server when test finishes
+	defer server.Close()
+
+	tests := []struct {
+		name    string
+		url     string
+		token   string
+		want    []byte
+		wantErr string
+	}{
+		{
+			name: "Case 1: Input url is valid",
+			url:  server.URL,
+			want: []byte{79, 75},
+		},
+		{
+			name:    "Case 2: Input url is invalid",
+			url:     "invalid",
+			wantErr: "unsupported protocol scheme",
+		},
+		{
+			name:    "Case 3: Git provider with invalid url",
+			url:     "github.com/mike-hoang/invalid-repo",
+			token:   "",
+			want:    []byte(nil),
+			wantErr: "failed to parse git repo. error:*",
+		},
+		{
+			name:    "Case 4: Public Github repo with missing blob",
+			url:     "https://github.com/devfile/library/main/README.md",
+			wantErr: "failed to parse git repo. error: url path to directory or file should contain 'tree' or 'blob'*",
+		},
+		{
+			name:    "Case 5: Public Github repo, with invalid token ",
+			url:     "https://github.com/devfile/library/blob/main/devfile.yaml",
+			token:   "fake-token",
+			wantErr: fmt.Sprintf(downloadErr, "https://"+RawGitHubHost+"/devfile/library/main/devfile.yaml"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := DownloadInMemory(HTTPRequestParams{URL: tt.url, Token: tt.token})
+			if (err != nil) != (tt.wantErr != "") {
+				t.Errorf("Failed to download file with error: %s", err)
+			} else if err == nil && !reflect.DeepEqual(data, tt.want) {
+				t.Errorf("Expected: %v, received: %v, difference at %v", tt.want, string(data[:]), pretty.Compare(tt.want, data))
+			} else if err != nil {
+				assert.Regexp(t, tt.wantErr, err.Error(), "Error message should match")
 			}
 		})
 	}
@@ -976,11 +1111,11 @@ func TestValidateK8sResourceName(t *testing.T) {
 
 func TestValidateFile(t *testing.T) {
 	// Create temp dir and temp file
-	tempDir, err := ioutil.TempDir("", "")
+	tempDir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Errorf("Failed to create temp dir: %s, error: %v", tempDir, err)
 	}
-	tempFile, err := ioutil.TempFile(tempDir, "")
+	tempFile, err := os.CreateTemp(tempDir, "")
 	if err != nil {
 		t.Errorf("Failed to create temp file: %s, error: %v", tempFile.Name(), err)
 	}
@@ -1017,94 +1152,15 @@ func TestValidateFile(t *testing.T) {
 	}
 }
 
-func TestGetGitUrlComponentsFromRaw(t *testing.T) {
-	validRawGitUrl := "https://raw.githubusercontent.com/username/project/branch/file/path"
-	invalidUrl := "github.com/not/valid/url"
-
-	tests := []struct {
-		name    string
-		url     string
-		wantErr bool
-	}{
-		{
-			name:    "should be able to get git url components",
-			url:     validRawGitUrl,
-			wantErr: false,
-		},
-		{
-			name:    "should fail with invalid raw git url",
-			url:     invalidUrl,
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := GetGitUrlComponentsFromRaw(tt.url)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Expected error: %t, got error: %t", tt.wantErr, err)
-			}
-		})
-	}
-}
-
-func TestCloneGitRepo(t *testing.T) {
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Errorf("Failed to create temp dir: %s, error: %v", tempDir, err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	invalidGitUrl := map[string]string{
-		"username": "devfile",
-		"project":  "nonexistent",
-		"branch":   "nonexistent",
-	}
-	validGitUrl := map[string]string{
-		"username": "devfile",
-		"project":  "library",
-		"branch":   "main",
-	}
-
-	tests := []struct {
-		name             string
-		gitUrlComponents map[string]string
-		destDir          string
-		wantErr          bool
-	}{
-		{
-			name:             "should fail with invalid git url",
-			gitUrlComponents: invalidGitUrl,
-			destDir:          filepath.Join(os.TempDir(), "nonexistent"),
-			wantErr:          true,
-		},
-		{
-			name:             "should be able to clone valid git url",
-			gitUrlComponents: validGitUrl,
-			destDir:          tempDir,
-			wantErr:          false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := CloneGitRepo(tt.gitUrlComponents, tt.destDir)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Expected error: %t, got error: %t", tt.wantErr, err)
-			}
-		})
-	}
-}
-
 func TestCopyFile(t *testing.T) {
 	// Create temp dir
-	tempDir, err := ioutil.TempDir("", "")
+	tempDir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Errorf("Failed to create temp dir: %s, error: %v", tempDir, err)
 	}
 
 	// Create temp file under temp dir as source file
-	tempFile, err := ioutil.TempFile(tempDir, "")
+	tempFile, err := os.CreateTemp(tempDir, "")
 	if err != nil {
 		t.Errorf("Failed to create temp file: %s, error: %v", tempFile.Name(), err)
 	}

@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,9 +21,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
-	"github.com/go-git/go-git/v5/plumbing"
 	"io"
-	"io/ioutil"
 	"math/big"
 	"net"
 	"net/http"
@@ -42,12 +40,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/devfile/library/pkg/testingutil/filesystem"
-	"github.com/fatih/color"
 	gitpkg "github.com/go-git/go-git/v5"
-	"github.com/gobwas/glob"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/gregjones/httpcache"
 	"github.com/gregjones/httpcache/diskcache"
+
+	"github.com/devfile/library/v2/pkg/testingutil/filesystem"
+	"github.com/fatih/color"
+	"github.com/gobwas/glob"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -56,10 +56,16 @@ import (
 	"k8s.io/klog"
 )
 
+type HTTPClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
 const (
-	HTTPRequestResponseTimeout = 30 * time.Second // HTTPRequestTimeout configures timeout of all HTTP requests
-	ModeReadWriteFile          = 0600             // default Permission for a file
-	CredentialPrefix           = "odo-"           // CredentialPrefix is the prefix of the credential that uses to access secure registry
+	HTTPRequestResponseTimeout   = 30 * time.Second           // HTTPRequestTimeout configures timeout of all HTTP requests
+	ModeReadWriteFile            = 0600                       // default Permission for a file
+	CredentialPrefix             = "odo-"                     // CredentialPrefix is the prefix of the credential that uses to access secure registry
+	TelemetryClientName          = "devfile-library"          //TelemetryClientName is the name of the devfile library client
+	TelemetryIndirectDevfileCall = "devfile-library-indirect" //TelemetryIndirectDevfileCall is used to identify calls made to retrieve the parent or plugin devfile
 )
 
 // httpCacheDir determines directory where odo will cache HTTP respones
@@ -86,9 +92,10 @@ type ResourceRequirementInfo struct {
 
 // HTTPRequestParams holds parameters of forming http request
 type HTTPRequestParams struct {
-	URL     string
-	Token   string
-	Timeout *int
+	URL                 string
+	Token               string
+	Timeout             *int
+	TelemetryClientName string //optional client name for telemetry
 }
 
 // DownloadParams holds parameters of forming file download request
@@ -298,10 +305,10 @@ func GetAbsPath(path string) (string, error) {
 // existList: List to verify that the returned name does not already exist
 // retries: number of retries to try generating a unique name
 // Returns:
-//		1. randomname: is prefix-suffix, where:
-//				prefix: string passed as prefix or fetched current directory of length same as the passed prefixMaxLen
-//				suffix: 4 char random string
-//      2. error: if requested number of retries also failed to generate unique name
+//  1. randomname: is prefix-suffix, where:
+//     prefix: string passed as prefix or fetched current directory of length same as the passed prefixMaxLen
+//     suffix: 4 char random string
+//  2. error: if requested number of retries also failed to generate unique name
 func GetRandomName(prefix string, prefixMaxLen int, existList []string, retries int) (string, error) {
 	prefix = TruncateString(GetDNS1123Name(strings.ToLower(prefix)), prefixMaxLen)
 	name := fmt.Sprintf("%s-%s", prefix, GenerateRandomString(4))
@@ -454,7 +461,7 @@ func checkPathExistsOnFS(path string, fs filesystem.Filesystem) bool {
 // host:port even if port was not specifically specified in the origin url.
 // If port is not specified, standart port corresponding to url schema is provided.
 // example: for url https://example.com function will return "example.com:443"
-//          for url https://example.com:8443 function will return "example:8443"
+// for url https://example.com:8443 function will return "example:8443"
 func GetHostWithPort(inputURL string) (string, error) {
 	u, err := url.Parse(inputURL)
 	if err != nil {
@@ -744,6 +751,9 @@ func HTTPGetRequest(request HTTPRequestParams, cacheFor int) ([]byte, error) {
 		req.Header.Add("Authorization", bearer)
 	}
 
+	//add the telemetry client name
+	req.Header.Add("Client", request.TelemetryClientName)
+
 	overriddenTimeout := HTTPRequestResponseTimeout
 	timeout := request.Timeout
 	if timeout != nil {
@@ -809,7 +819,7 @@ func HTTPGetRequest(request HTTPRequestParams, cacheFor int) ([]byte, error) {
 	}
 
 	// Process http response
-	bytes, err := ioutil.ReadAll(resp.Body)
+	bytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -845,7 +855,11 @@ func FilterIgnores(filesChanged, filesDeleted, absIgnoreRules []string) (filesCh
 // IsValidProjectDir checks that the folder to download the project from devfile is
 // either empty or only contains the devfile used.
 func IsValidProjectDir(path string, devfilePath string) error {
-	files, err := ioutil.ReadDir(path)
+	return isValidProjectDirOnFS(path, devfilePath, filesystem.DefaultFs{})
+}
+
+func isValidProjectDirOnFS(path string, devfilePath string, fs filesystem.Filesystem) error {
+	files, err := fs.ReadDir(path)
 	if err != nil {
 		return err
 	}
@@ -872,6 +886,15 @@ func ConvertGitSSHRemoteToHTTPS(remote string) string {
 	remote = strings.Replace(remote, ":", "/", 1)
 	remote = strings.Replace(remote, "git@", "https://", 1)
 	return remote
+}
+
+// IsGitProviderRepo checks if the url matches a repo from a supported git provider
+func IsGitProviderRepo(url string) bool {
+	if strings.Contains(url, RawGitHubHost) || strings.Contains(url, GitHubHost) ||
+		strings.Contains(url, GitLabHost) || strings.Contains(url, BitbucketHost) {
+		return true
+	}
+	return false
 }
 
 // GetAndExtractZip downloads a zip file from a URL with a http prefix or
@@ -1056,6 +1079,7 @@ func DownloadFile(params DownloadParams) error {
 }
 
 // DownloadFileInMemory uses the url to download the file and return bytes
+// Deprecated, use DownloadInMemory() instead
 func DownloadFileInMemory(url string) ([]byte, error) {
 	var httpClient = &http.Client{Transport: &http.Transport{
 		ResponseHeaderTimeout: HTTPRequestResponseTimeout,
@@ -1070,7 +1094,63 @@ func DownloadFileInMemory(url string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
+}
+
+// DownloadInMemory uses HTTPRequestParams to download the file and return bytes.
+// Use the pkg/devfile/parser/utils.go DownloadInMemory() invocation if you want to
+// call with a client instead.
+func DownloadInMemory(params HTTPRequestParams) ([]byte, error) {
+	var httpClient = &http.Client{Transport: &http.Transport{
+		ResponseHeaderTimeout: HTTPRequestResponseTimeout,
+	}, Timeout: HTTPRequestResponseTimeout}
+
+	var g *GitUrl
+	var err error
+
+	if IsGitProviderRepo(params.URL) {
+		g, err = NewGitURL(params.URL, params.Token)
+		if err != nil {
+			return nil, errors.Errorf("failed to parse git repo. error: %v", err)
+		}
+	}
+
+	return g.downloadInMemoryWithClient(params, httpClient)
+}
+
+func (g *GitUrl) downloadInMemoryWithClient(params HTTPRequestParams, httpClient HTTPClient) ([]byte, error) {
+	var url string
+	url = params.URL
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if IsGitProviderRepo(url) {
+		url = g.GitRawFileAPI()
+		req, err = http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		if params.Token != "" {
+			req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", params.Token))
+		}
+	}
+
+	//add the telemetry client name in the header
+	req.Header.Add("Client", params.TelemetryClientName)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// We have a non 1xx / 2xx status, return an error
+	if (resp.StatusCode - 300) > 0 {
+		return nil, errors.Errorf("failed to retrieve %s, %v: %s", url, resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+	defer resp.Body.Close()
+
+	return io.ReadAll(resp.Body)
 }
 
 // ValidateK8sResourceName sanitizes kubernetes resource name with the following requirements:
@@ -1151,6 +1231,7 @@ func ValidateFile(filePath string) error {
 }
 
 // GetGitUrlComponentsFromRaw converts a raw GitHub file link to a map of the url components
+// Deprecated: in favor of the method git.ParseGitUrl() with the devfile/library/v2/pkg/git package
 func GetGitUrlComponentsFromRaw(rawGitURL string) (map[string]string, error) {
 	var urlComponents map[string]string
 
@@ -1183,6 +1264,7 @@ func GetGitUrlComponentsFromRaw(rawGitURL string) (map[string]string, error) {
 }
 
 // CloneGitRepo clones a GitHub repo to a destination directory
+// Deprecated: in favor of the method git.CloneGitRepo() with the devfile/library/v2/pkg/git package
 func CloneGitRepo(gitUrlComponents map[string]string, destDir string) error {
 	gitUrl := fmt.Sprintf("https://github.com/%s/%s.git", gitUrlComponents["username"], gitUrlComponents["project"])
 	branch := fmt.Sprintf("refs/heads/%s", gitUrlComponents["branch"])

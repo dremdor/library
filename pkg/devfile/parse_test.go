@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,22 +16,179 @@
 package devfile
 
 import (
-	v1 "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
+	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	v1 "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
+
+	schema "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	"github.com/devfile/api/v2/pkg/validation/variables"
-	"github.com/devfile/library/pkg/devfile/parser"
-	"github.com/devfile/library/pkg/devfile/parser/data/v2/common"
+	"github.com/devfile/library/v2/pkg/devfile/parser"
+	"github.com/devfile/library/v2/pkg/devfile/parser/data/v2/common"
+	"github.com/devfile/library/v2/pkg/testingutil"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func TestParseDevfileAndValidate(t *testing.T) {
+	falseValue := false
+	trueValue := true
 	convertUriToInline := false
 	K8sLikeComponentOriginalURIKey := "api.devfile.io/k8sLikeComponent-originalURI"
+
+	devfileStruct := schema.DevWorkspaceTemplate{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "2.1.0",
+		},
+		Spec: schema.DevWorkspaceTemplateSpec{
+			DevWorkspaceTemplateSpecContent: schema.DevWorkspaceTemplateSpecContent{
+				Commands: []schema.Command{
+					{
+						Id: "run",
+						CommandUnion: schema.CommandUnion{
+							Exec: &schema.ExecCommand{
+								CommandLine: "./main {{ PARAMS }}",
+								Component:   "runtime",
+								WorkingDir:  "${PROJECT_SOURCE}",
+								LabeledCommand: schema.LabeledCommand{
+									BaseCommand: schema.BaseCommand{
+										Group: &schema.CommandGroup{
+											Kind:      "run",
+											IsDefault: &trueValue,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				Components: []schema.Component{
+					{
+						Name: "runtime",
+						ComponentUnion: schema.ComponentUnion{
+							Container: &schema.ContainerComponent{
+								Endpoints: []schema.Endpoint{
+									{
+										Name:       "http",
+										TargetPort: 8080,
+									},
+								},
+								Container: schema.Container{
+									Image:        "golang:latest",
+									MemoryLimit:  "1024Mi",
+									MountSources: &trueValue,
+								},
+							},
+						},
+					},
+					{
+						Name: "outerloop-deploy",
+						ComponentUnion: schema.ComponentUnion{
+							Kubernetes: &schema.KubernetesComponent{
+								K8sLikeComponent: schema.K8sLikeComponent{
+									K8sLikeComponentLocation: schema.K8sLikeComponentLocation{
+										Uri: "http://127.0.0.1:8080/outerloop-deploy.yaml",
+									},
+								},
+							},
+						},
+					},
+					{
+						Name: "outerloop-deploy2",
+						ComponentUnion: schema.ComponentUnion{
+							Openshift: &schema.OpenshiftComponent{
+								K8sLikeComponent: schema.K8sLikeComponent{
+									K8sLikeComponentLocation: schema.K8sLikeComponentLocation{
+										Uri: "http://127.0.0.1:8080/outerloop-service.yaml",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	devfileContent := `commands:
+- exec:
+    commandLine: ./main {{ PARAMS }}
+    component: runtime
+    group:
+      isDefault: true
+      kind: run
+    workingDir: ${PROJECT_SOURCE}
+  id: run
+components:
+- container:
+    endpoints:
+    - name: http
+      targetPort: 8080
+    image: golang:latest
+    memoryLimit: 1024Mi
+    mountSources: true
+  name: runtime
+- kubernetes:
+    uri: http://127.0.0.1:8080/outerloop-deploy.yaml
+  name: outerloop-deploy
+- openshift:
+    uri: http://127.0.0.1:8080/outerloop-service.yaml
+  name: outerloop-deploy2
+metadata:
+  description: Stack with the latest Go version
+  displayName: Go Runtime
+  icon: https://raw.githubusercontent.com/devfile-samples/devfile-stack-icons/main/golang.svg
+  language: go
+  name: my-go-app
+  projectType: go
+  tags:
+  - Go
+  version: 1.0.0
+schemaVersion: 2.2.2
+`
+
+	devfileContentWithVariable := devfileContent + `variables:
+  PARAMS: foo`
+	devfileContentWithParent := `schemaVersion: 2.2.2
+parent:
+  id: devfile1
+  registryUrl: http://127.0.0.1:8080/registry
+`
+	devfileContentWithUnsupportedSchema := `schemaVersion: 2.3.5
+parent:
+  id: devfile1
+  registryUrl: http://127.0.0.1:8080/registry
+`
+	devfileContentWithParentNoRegistry := `schemaVersion: 2.2.2
+parent:
+  id: devfile1
+`
+	devfileContentWithCRDParent := `schemaVersion: 2.2.2
+parent:
+  kubernetes:
+    name: devfile1
+  registryUrl: http://127.0.0.1:8080/registry
+`
+
+	registryIndex := `[{
+		"name": "devfile1",
+		"version": "1.0.0",
+		"type": "stack",
+		"links": {
+		  "self": "devfile-catalog/devfile1:1.0.0"
+		},
+		"resources": [
+		  "devfile.yaml"
+		]
+}]`
 	outerloopDeployContent := `
 kind: Deployment
 apiVersion: apps/v1
@@ -78,13 +235,18 @@ spec:
   type: LoadBalancer
 `
 	uri := "127.0.0.1:8080"
-	var testServer *httptest.Server
-	testServer = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	testServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var err error
 		if strings.Contains(r.URL.Path, "/outerloop-deploy.yaml") {
 			_, err = w.Write([]byte(outerloopDeployContent))
 		} else if strings.Contains(r.URL.Path, "/outerloop-service.yaml") {
 			_, err = w.Write([]byte(outerloopServiceContent))
+		} else if strings.Contains(r.URL.Path, "/devfile1.yaml") {
+			_, err = w.Write([]byte(devfileContent))
+		} else if r.URL.Path == "/registry/devfiles/devfile1/" {
+			_, err = w.Write([]byte(devfileContent))
+		} else if r.URL.Path == "/index" {
+			_, err = w.Write([]byte(registryIndex))
 		}
 		if err != nil {
 			t.Errorf("unexpected error while writing yaml: %v", err)
@@ -94,7 +256,7 @@ spec:
 	// create a listener with the desired port.
 	l, err := net.Listen("tcp", uri)
 	if err != nil {
-		t.Errorf("Test_parseParentAndPluginFromURI() unexpected error while creating listener: %v", err)
+		t.Errorf("TestParseDevfileAndValidate() unexpected error while creating listener: %v", err)
 	}
 
 	// NewUnstartedServer creates a listener. Close that listener and replace
@@ -105,45 +267,8 @@ spec:
 	testServer.Start()
 	defer testServer.Close()
 
-	devfileContent := `commands:
-- exec:
-    commandLine: ./main {{ PARAMS }}
-    component: runtime
-    group:
-      isDefault: true
-      kind: run
-    workingDir: ${PROJECT_SOURCE}
-  id: run
-components:
-- container:
-    endpoints:
-    - name: http
-      targetPort: 8080
-    image: golang:latest
-    memoryLimit: 1024Mi
-    mountSources: true
-  name: runtime
-- kubernetes:
-    uri: http://127.0.0.1:8080/outerloop-deploy.yaml
-  name: outerloop-deploy
-- openshift:
-    uri: http://127.0.0.1:8080/outerloop-service.yaml
-  name: outerloop-deploy2
-metadata:
-  description: Stack with the latest Go version
-  displayName: Go Runtime
-  icon: https://raw.githubusercontent.com/devfile-samples/devfile-stack-icons/main/golang.svg
-  language: go
-  name: my-go-app
-  projectType: go
-  tags:
-  - Go
-  version: 1.0.0
-schemaVersion: 2.2.0
-`
+	unsupportedSchemaError := `error parsing devfile because of non-compliant data due to unable to find schema for version "2.3.5". The parser supports devfile schema for version 2.0.0, 2.1.0, 2.2.0, 2.2.1, 2.2.2, 2.3.0, v1alpha2`
 
-	devfileContentWithVariable := devfileContent + `variables:
-  PARAMS: foo`
 	type args struct {
 		args parser.ParserArgs
 	}
@@ -155,6 +280,8 @@ schemaVersion: 2.2.0
 		wantKubernetesInline string
 		wantOpenshiftInline  string
 		wantVariables        map[string]string
+		additionalChecks     func(parser.DevfileObj) error
+		wantErrorStr         *string
 	}{
 		{
 			name: "with external overriding variables",
@@ -173,11 +300,13 @@ schemaVersion: 2.2.0
 				"PARAMS": "bar",
 			},
 			wantVarWarning: variables.VariableWarning{
-				Commands:        map[string][]string{},
-				Components:      map[string][]string{},
-				Projects:        map[string][]string{},
-				StarterProjects: map[string][]string{},
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
 			},
+			wantErrorStr: nil,
 		},
 		{
 			name: "with new external variables",
@@ -197,11 +326,13 @@ schemaVersion: 2.2.0
 				"OTHER":  "other",
 			},
 			wantVarWarning: variables.VariableWarning{
-				Commands:        map[string][]string{},
-				Components:      map[string][]string{},
-				Projects:        map[string][]string{},
-				StarterProjects: map[string][]string{},
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
 			},
+			wantErrorStr: nil,
 		}, {
 			name: "with new external variables",
 			args: args{
@@ -219,11 +350,13 @@ schemaVersion: 2.2.0
 				"PARAMS": "baz",
 			},
 			wantVarWarning: variables.VariableWarning{
-				Commands:        map[string][]string{},
-				Components:      map[string][]string{},
-				Projects:        map[string][]string{},
-				StarterProjects: map[string][]string{},
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
 			},
+			wantErrorStr: nil,
 		}, {
 			name: "with external variables and covertUriToInline is false",
 			args: args{
@@ -240,18 +373,463 @@ schemaVersion: 2.2.0
 				"PARAMS": "baz",
 			},
 			wantVarWarning: variables.VariableWarning{
-				Commands:        map[string][]string{},
-				Components:      map[string][]string{},
-				Projects:        map[string][]string{},
-				StarterProjects: map[string][]string{},
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
 			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "with flattening set to false and setBooleanDefaults to true",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "baz",
+					},
+					FlattenedDevfile: &falseValue,
+					Data:             []byte(devfileContent),
+				},
+			},
+			wantCommandLine: "./main baz",
+			wantVariables: map[string]string{
+				"PARAMS": "baz",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "with setBooleanDefaults to false",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "baz",
+					},
+					SetBooleanDefaults: &falseValue,
+					Data:               []byte(devfileContent),
+				},
+			},
+			wantCommandLine: "./main baz",
+			wantVariables: map[string]string{
+				"PARAMS": "baz",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "get content from path",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "baz",
+					},
+					Path: "./testdata/devfile.yaml",
+				},
+			},
+			wantCommandLine: "./main baz",
+			wantVariables: map[string]string{
+				"PARAMS": "baz",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "get content from url",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "baz",
+					},
+					URL: "http://" + filepath.Join(uri, "devfile1.yaml"),
+				},
+			},
+			wantCommandLine: "./main baz",
+			wantVariables: map[string]string{
+				"PARAMS": "baz",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "with parent and registry url in devfile",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "baz",
+					},
+					Data: []byte(devfileContentWithParent),
+				},
+			},
+			wantCommandLine: "./main baz",
+			wantVariables: map[string]string{
+				"PARAMS": "baz",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "with parent and no registry url in devfile",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "baz",
+					},
+					Data: []byte(devfileContentWithParentNoRegistry),
+					RegistryURLs: []string{
+						"http://127.0.0.1:8080/registry",
+					},
+				},
+			},
+			wantCommandLine: "./main baz",
+			wantVariables: map[string]string{
+				"PARAMS": "baz",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "getting from cluster and setting default namespace",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "baz",
+					},
+					Data: []byte(devfileContentWithCRDParent),
+					K8sClient: func() client.Client {
+						testK8sClient := &testingutil.FakeK8sClient{
+							ExpectedNamespace: "my-namespace",
+							DevWorkspaceResources: map[string]schema.DevWorkspaceTemplate{
+								"devfile1": devfileStruct,
+							},
+						}
+						return testK8sClient
+					}(),
+					Context:          context.Background(),
+					DefaultNamespace: "my-namespace",
+				},
+			},
+			wantCommandLine: "./main baz",
+			wantVariables: map[string]string{
+				"PARAMS": "baz",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "parsing devfile with context path containing multiple devfiles => priority to devfile.yaml",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "from devfile.yaml based on priority",
+					},
+					Path: "./testdata",
+				},
+			},
+			wantCommandLine: "./main from devfile.yaml based on priority",
+			wantVariables: map[string]string{
+				"PARAMS": "from devfile.yaml based on priority",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			additionalChecks: func(devfileObj parser.DevfileObj) error {
+				if devfileObj.Data.GetMetadata().DisplayName != "Go Runtime (devfile.yaml)" {
+					return fmt.Errorf("expected 'Go Runtime (devfile.yaml)' as metadata.displayName in devfile, but got %q",
+						devfileObj.Data.GetMetadata().DisplayName)
+				}
+				return nil
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "parsing devfile with context path containing multiple devfiles => priority to .devfile.yaml",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "from .devfile.yaml based on priority",
+					},
+					Path: "./testdata/priority-for-dot_devfile_yaml",
+				},
+			},
+			wantCommandLine: "./main from .devfile.yaml based on priority",
+			wantVariables: map[string]string{
+				"PARAMS": "from .devfile.yaml based on priority",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			additionalChecks: func(devfileObj parser.DevfileObj) error {
+				if devfileObj.Data.GetMetadata().DisplayName != "Go Runtime (.devfile.yaml)" {
+					return fmt.Errorf("expected 'Go Runtime (.devfile.yaml)' as metadata.displayName in devfile, but got %q",
+						devfileObj.Data.GetMetadata().DisplayName)
+				}
+				return nil
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "parsing devfile with context path containing multiple devfiles => priority to devfile.yml",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "from devfile.yml based on priority",
+					},
+					Path: "./testdata/priority-for-devfile_yml",
+				},
+			},
+			wantCommandLine: "./main from devfile.yml based on priority",
+			wantVariables: map[string]string{
+				"PARAMS": "from devfile.yml based on priority",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			additionalChecks: func(devfileObj parser.DevfileObj) error {
+				if devfileObj.Data.GetMetadata().DisplayName != "Test stack (devfile.yml)" {
+					return fmt.Errorf("expected 'Test stack (devfile.yml)' as metadata.displayName in devfile, but got %q",
+						devfileObj.Data.GetMetadata().DisplayName)
+				}
+				return nil
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "parsing devfile with context path containing multiple devfiles => priority to .devfile.yml",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "from .devfile.yml based on priority",
+					},
+					Path: "./testdata/priority-for-dot_devfile_yml",
+				},
+			},
+			wantCommandLine: "./main from .devfile.yml based on priority",
+			wantVariables: map[string]string{
+				"PARAMS": "from .devfile.yml based on priority",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			additionalChecks: func(devfileObj parser.DevfileObj) error {
+				if devfileObj.Data.GetMetadata().DisplayName != "Test stack (.devfile.yml)" {
+					return fmt.Errorf("expected 'Test stack (.devfile.yml)' as metadata.displayName in devfile, but got %q",
+						devfileObj.Data.GetMetadata().DisplayName)
+				}
+				return nil
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "parsing devfile with .yml extension",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "from devfile.yml",
+					},
+					Path: "./testdata/devfile.yml",
+				},
+			},
+			wantCommandLine: "./main from devfile.yml",
+			wantVariables: map[string]string{
+				"PARAMS": "from devfile.yml",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			additionalChecks: func(devfileObj parser.DevfileObj) error {
+				if devfileObj.Data.GetMetadata().DisplayName != "Test stack (devfile.yml)" {
+					return fmt.Errorf("expected 'Test stack (devfile.yml)' as metadata.displayName in devfile, but got %q",
+						devfileObj.Data.GetMetadata().DisplayName)
+				}
+				return nil
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "parsing .devfile with .yml extension",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "from .devfile.yml",
+					},
+					Path: "./testdata/.devfile.yml",
+				},
+			},
+			wantCommandLine: "./main from .devfile.yml",
+			wantVariables: map[string]string{
+				"PARAMS": "from .devfile.yml",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			additionalChecks: func(devfileObj parser.DevfileObj) error {
+				if devfileObj.Data.GetMetadata().DisplayName != "Test stack (.devfile.yml)" {
+					return fmt.Errorf("expected 'Test stack (.devfile.yml)' as metadata.displayName in devfile, but got %q",
+						devfileObj.Data.GetMetadata().DisplayName)
+				}
+				return nil
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "parsing .devfile with .yaml extension",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "from .devfile.yaml",
+					},
+					Path: "./testdata/.devfile.yaml",
+				},
+			},
+			wantCommandLine: "./main from .devfile.yaml",
+			wantVariables: map[string]string{
+				"PARAMS": "from .devfile.yaml",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			additionalChecks: func(devfileObj parser.DevfileObj) error {
+				if devfileObj.Data.GetMetadata().DisplayName != "Go Runtime (.devfile.yaml)" {
+					return fmt.Errorf("expected 'Go Runtime (.devfile.yaml)' as metadata.displayName in devfile, but got %q",
+						devfileObj.Data.GetMetadata().DisplayName)
+				}
+				return nil
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "parsing any valid devfile regardless of extension",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "from any valid devfile file",
+					},
+					Path: "./testdata/valid-devfile.yaml.txt",
+				},
+			},
+			wantCommandLine: "./main from any valid devfile file",
+			wantVariables: map[string]string{
+				"PARAMS": "from any valid devfile file",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			additionalChecks: func(devfileObj parser.DevfileObj) error {
+				if devfileObj.Data.GetMetadata().DisplayName != "Test stack (valid-devfile.yaml.txt)" {
+					return fmt.Errorf("expected 'Test stack (valid-devfile.yaml.txt)' as metadata.displayName in devfile, but got %q",
+						devfileObj.Data.GetMetadata().DisplayName)
+				}
+				return nil
+			},
+			wantErrorStr: nil,
+		},
+		{
+			name: "with unsupported schema version",
+			args: args{
+				args: parser.ParserArgs{
+					ExternalVariables: map[string]string{
+						"PARAMS": "baz",
+					},
+					Data: []byte(devfileContentWithUnsupportedSchema),
+				},
+			},
+			wantCommandLine: "./main baz",
+			wantVariables: map[string]string{
+				"PARAMS": "baz",
+			},
+			wantVarWarning: variables.VariableWarning{
+				Commands:          map[string][]string{},
+				Components:        map[string][]string{},
+				Projects:          map[string][]string{},
+				StarterProjects:   map[string][]string{},
+				DependentProjects: map[string][]string{},
+			},
+			wantErrorStr: &unsupportedSchemaError,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gotD, gotVarWarning, err := ParseDevfileAndValidate(tt.args.args)
-			if err != nil {
-				t.Errorf("ParseDevfileAndValidate() error = %v, wantErr nil", err)
+			if err != nil && err.Error() == *tt.wantErrorStr {
+				t.Log("Correctly identified unsupported schema version")
+				return
+			} else if err != nil {
+				t.Errorf("ParseDevfileAndValidate() error = %v, wantErrStr = %v", err, tt.wantErrorStr)
 				return
 			}
 			commands, err := gotD.Data.GetCommands(common.DevfileOptions{})
@@ -332,12 +910,46 @@ schemaVersion: 2.2.0
 				}
 			}
 
+			getContainerCompOptions := common.DevfileOptions{
+				ComponentOptions: common.ComponentOptions{
+					ComponentType: v1.ContainerComponentType,
+				},
+			}
+
+			containerComponents, err := gotD.Data.GetComponents(getContainerCompOptions)
+			if err != nil {
+				t.Errorf("unexpected error getting container component")
+			}
+			containerComponent := containerComponents[0]
+			dedicatedPod := containerComponent.Container.DedicatedPod
+			//check that unset booleans are set to defaults if flattenedDevfile is false
+			if tt.args.args.SetBooleanDefaults == nil {
+				if tt.args.args.FlattenedDevfile != nil && *tt.args.args.FlattenedDevfile == false {
+					if dedicatedPod == nil || dedicatedPod == &trueValue {
+						t.Errorf("unset property dedicatedPod is expected to have a default value of false")
+					}
+				}
+			} else {
+				if *tt.args.args.SetBooleanDefaults == false {
+					if dedicatedPod != nil {
+						t.Errorf("unset property dedicatedPod should be set to nil")
+					}
+				}
+			}
+
 			if !reflect.DeepEqual(gotVarWarning, tt.wantVarWarning) {
 				t.Errorf("ParseDevfileAndValidate() gotVarWarning = %v, want %v", gotVarWarning, tt.wantVarWarning)
 			}
 			variables := gotD.Data.GetDevfileWorkspaceSpec().Variables
 			if !reflect.DeepEqual(variables, tt.wantVariables) {
 				t.Errorf("variables are %+v, expected %+v", variables, tt.wantVariables)
+			}
+
+			if tt.additionalChecks != nil {
+				err = tt.additionalChecks(gotD)
+				if err != nil {
+					t.Errorf("unexpected error while performing specific checks: %v", err)
+				}
 			}
 		})
 	}

@@ -1,15 +1,13 @@
 # See the OWNERS docs: https://git.k8s.io/community/contributors/guide/owners.md
 
 approvers:
-- amisevsk
 - elsony
-- kim-tsao
-- maysunfaisal
-- mik-dass
-- yangcao77
+- Jdubrick
+- michael-valdron
+- thepetk
 
 reviewers:
 - elsony
-- kim-tsao
-- maysunfaisal
-- yangcao77
+- Jdubrick
+- michael-valdron
+- thepetk

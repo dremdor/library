@@ -1,5 +1,5 @@
 //
-// Copyright 2022 Red Hat, Inc.
+// Copyright Red Hat
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,24 +16,34 @@
 package generator
 
 import (
+	"encoding/json"
 	"fmt"
-	"github.com/hashicorp/go-multierror"
 	"path/filepath"
 	"reflect"
 	"strings"
 
 	v1 "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
-	"github.com/devfile/library/pkg/devfile/parser"
-	"github.com/devfile/library/pkg/devfile/parser/data/v2/common"
+	"github.com/devfile/api/v2/pkg/attributes"
+	"github.com/hashicorp/go-multierror"
+
+	"github.com/devfile/library/v2/pkg/devfile/parser"
+	"github.com/devfile/library/v2/pkg/devfile/parser/data/v2/common"
 	buildv1 "github.com/openshift/api/build/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1 "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiext "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
+)
+
+const (
+	ContainerOverridesAttribute = "container-overrides"
+	PodOverridesAttribute       = "pod-overrides"
 )
 
 // convertEnvs converts environment variables from the devfile structure to kubernetes structure
@@ -143,11 +153,12 @@ func addSyncRootFolder(container *corev1.Container, sourceMapping string) string
 
 	// Note: PROJECTS_ROOT & PROJECT_SOURCE are validated at the devfile parser level
 	// Add PROJECTS_ROOT to the container
-	container.Env = append(container.Env,
-		corev1.EnvVar{
+	container.Env = append([]corev1.EnvVar{
+		{
 			Name:  EnvProjectsRoot,
 			Value: syncRootFolder,
-		})
+		},
+	}, container.Env...)
 
 	return syncRootFolder
 }
@@ -179,11 +190,12 @@ func addSyncFolder(container *corev1.Container, sourceVolumePath string, project
 		}
 	}
 
-	container.Env = append(container.Env,
-		corev1.EnvVar{
+	container.Env = append([]corev1.EnvVar{
+		{
 			Name:  EnvProjectsSrc,
 			Value: syncFolder,
-		})
+		},
+	}, container.Env...)
 
 	return nil
 }
@@ -231,7 +243,7 @@ type podTemplateSpecParams struct {
 }
 
 // getPodTemplateSpec gets a pod template spec that can be used to create a deployment spec
-func getPodTemplateSpec(podTemplateSpecParams podTemplateSpecParams) *corev1.PodTemplateSpec {
+func getPodTemplateSpec(podTemplateSpecParams podTemplateSpecParams) (*corev1.PodTemplateSpec, error) {
 	podTemplateSpec := &corev1.PodTemplateSpec{
 		ObjectMeta: podTemplateSpecParams.ObjectMeta,
 		Spec: corev1.PodSpec{
@@ -241,7 +253,106 @@ func getPodTemplateSpec(podTemplateSpecParams podTemplateSpecParams) *corev1.Pod
 		},
 	}
 
-	return podTemplateSpec
+	return podTemplateSpec, nil
+}
+
+// needsPodOverrides returns true if PodOverridesAttribute is present at Devfile or Container level attributes
+func needsPodOverrides(globalAttributes attributes.Attributes, components []v1.Component) bool {
+	if globalAttributes.Exists(PodOverridesAttribute) {
+		return true
+	}
+	for _, component := range components {
+		if component.Attributes.Exists(PodOverridesAttribute) {
+			return true
+		}
+	}
+	return false
+}
+
+// applyPodOverrides returns a list of all the PodOverridesAttribute set at Devfile and Container level attributes
+func applyPodOverrides(globalAttributes attributes.Attributes, components []v1.Component, podTemplateSpec *corev1.PodTemplateSpec) (*corev1.PodTemplateSpec, error) {
+	overrides, err := getPodOverrides(globalAttributes, components)
+	if err != nil {
+		return nil, err
+	}
+	// Workaround: the definition for corev1.PodSpec does not make containers optional, so even a nil list
+	// will be interpreted as "delete all containers" as the serialized patch will include "containers": null.
+	// To avoid this, save the original containers and reset them at the end.
+	originalContainers := podTemplateSpec.Spec.Containers
+	// Save fields we do not allow to be configured in pod-overrides
+	originalInitContainers := podTemplateSpec.Spec.InitContainers
+	originalVolumes := podTemplateSpec.Spec.Volumes
+
+	patchedTemplateBytes, err := json.Marshal(podTemplateSpec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal deployment to yaml: %w", err)
+	}
+	for _, override := range overrides {
+		patchedTemplateBytes, err = strategicpatch.StrategicMergePatch(patchedTemplateBytes, override.Raw, &corev1.PodTemplateSpec{})
+		if err != nil {
+			return nil, fmt.Errorf("error applying pod overrides: %w", err)
+		}
+	}
+	patchedPodTemplateSpec := corev1.PodTemplateSpec{}
+	if err := json.Unmarshal(patchedTemplateBytes, &patchedPodTemplateSpec); err != nil {
+		return nil, fmt.Errorf("error applying pod overrides: %w", err)
+	}
+	patchedPodTemplateSpec.Spec.Containers = originalContainers
+	patchedPodTemplateSpec.Spec.InitContainers = originalInitContainers
+	patchedPodTemplateSpec.Spec.Volumes = originalVolumes
+	return &patchedPodTemplateSpec, nil
+}
+
+// getPodOverrides returns PodTemplateSpecOverrides for every instance of the pod overrides attribute
+// present in the DevWorkspace. The order of elements is
+// 1. Pod overrides defined on Container components, in the order they appear in the DevWorkspace
+// 2. Pod overrides defined in the global attributes field (.spec.template.attributes)
+func getPodOverrides(globalAttributes attributes.Attributes, components []v1.Component) ([]apiext.JSON, error) {
+	var allOverrides []apiext.JSON
+
+	for _, component := range components {
+		if component.Attributes.Exists(PodOverridesAttribute) {
+			override := corev1.PodTemplateSpec{}
+			// Check format of pod-overrides to detect errors early
+			if err := component.Attributes.GetInto(PodOverridesAttribute, &override); err != nil {
+				return nil, fmt.Errorf("failed to parse %s attribute on component %s: %w", PodOverridesAttribute, component.Name, err)
+			}
+			// Do not allow overriding containers or volumes
+			if override.Spec.Containers != nil {
+				return nil, fmt.Errorf("cannot use %s to override pod containers (component %s)", PodOverridesAttribute, component.Name)
+			}
+			if override.Spec.InitContainers != nil {
+				return nil, fmt.Errorf("cannot use %s to override pod initContainers (component %s)", PodOverridesAttribute, component.Name)
+			}
+			if override.Spec.Volumes != nil {
+				return nil, fmt.Errorf("cannot use %s to override pod volumes (component %s)", PodOverridesAttribute, component.Name)
+			}
+			patchData := component.Attributes[PodOverridesAttribute]
+			allOverrides = append(allOverrides, patchData)
+		}
+	}
+
+	if globalAttributes.Exists(PodOverridesAttribute) {
+		override := corev1.PodTemplateSpec{}
+		err := globalAttributes.GetInto(PodOverridesAttribute, &override)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse %s attribute for pod: %w", PodOverridesAttribute, err)
+		}
+		// Do not allow overriding containers or volumes
+		if override.Spec.Containers != nil {
+			return nil, fmt.Errorf("cannot use %s to override pod containers", PodOverridesAttribute)
+		}
+		if override.Spec.InitContainers != nil {
+			return nil, fmt.Errorf("cannot use %s to override pod initContainers", PodOverridesAttribute)
+		}
+		if override.Spec.Volumes != nil {
+			return nil, fmt.Errorf("cannot use %s to override pod volumes", PodOverridesAttribute)
+		}
+		patchData := globalAttributes[PodOverridesAttribute]
+		allOverrides = append(allOverrides, patchData)
+	}
+
+	return allOverrides, nil
 }
 
 // deploymentSpecParams is a struct that contains the required data to create a deployment spec object
@@ -422,7 +533,7 @@ func getNetworkingV1IngressSpec(ingressSpecParams IngressSpecParams) *networking
 										},
 									},
 								},
-								//Field is required to be set based on attempt to create the ingress
+								// Field is required to be set based on attempt to create the ingress
 								PathType: &pathTypeImplementationSpecific,
 							},
 						},
@@ -610,6 +721,7 @@ func getAllContainers(devfileObj parser.DevfileObj, options common.DevfileOption
 		if comp.Container.MountSources == nil || *comp.Container.MountSources {
 			syncRootFolder := addSyncRootFolder(container, comp.Container.SourceMapping)
 
+			// Always set PROJECT_SOURCE, regardless of project presence
 			projects, err := devfileObj.Data.GetProjects(common.DevfileOptions{})
 			if err != nil {
 				return nil, err
@@ -622,6 +734,73 @@ func getAllContainers(devfileObj parser.DevfileObj, options common.DevfileOption
 		containers = append(containers, *container)
 	}
 	return containers, nil
+}
+
+// containerOverridesHandler overrides the attributes of a container component as defined inside ContainerOverridesAttribute by a strategic merge patch.
+func containerOverridesHandler(comp v1.Component, container *corev1.Container) (*corev1.Container, error) {
+	// Apply the override
+	override := &corev1.Container{}
+	if err := comp.Attributes.GetInto(ContainerOverridesAttribute, override); err != nil {
+		return nil, fmt.Errorf("failed to parse %s attribute on component %s: %w", ContainerOverridesAttribute, comp.Name, err)
+	}
+
+	restrictContainerOverride := func(override *corev1.Container) error {
+		var invalidFields []string
+		if override.Name != "" {
+			invalidFields = append(invalidFields, "name")
+		}
+		if override.Image != "" {
+			invalidFields = append(invalidFields, "image")
+		}
+		if override.Command != nil {
+			invalidFields = append(invalidFields, "command")
+
+		}
+		if override.Args != nil {
+			invalidFields = append(invalidFields, "args")
+
+		}
+		if override.Ports != nil {
+			invalidFields = append(invalidFields, "ports")
+
+		}
+		if override.VolumeMounts != nil {
+			invalidFields = append(invalidFields, "volumeMounts")
+
+		}
+		if override.Env != nil {
+			invalidFields = append(invalidFields, "env")
+		}
+		if len(invalidFields) != 0 {
+			return fmt.Errorf("cannot use %s to override container %s", ContainerOverridesAttribute, strings.Join(invalidFields, ", "))
+		}
+		return nil
+	}
+	// check if the override key is allowed
+	if err := restrictContainerOverride(override); err != nil {
+		return nil, fmt.Errorf("failed to parse %s attribute on component %s: %w", ContainerOverridesAttribute, comp.Name, err)
+	}
+
+	// get the container-overrides data
+	overrideJSON := comp.Attributes[ContainerOverridesAttribute]
+
+	originalBytes, err := json.Marshal(container)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal container to yaml: %w", err)
+	}
+	patchedBytes, err := strategicpatch.StrategicMergePatch(originalBytes, overrideJSON.Raw, &corev1.Container{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to apply container overrides: %w", err)
+	}
+	patched := &corev1.Container{}
+	if err := json.Unmarshal(patchedBytes, patched); err != nil {
+		return nil, fmt.Errorf("error applying container overrides: %w", err)
+	}
+	// Applying the patch will overwrite the container's name and image as corev1.Container.Name
+	// does not have the omitempty json tag.
+	patched.Name = container.Name
+	patched.Image = container.Image
+	return patched, nil
 }
 
 // getContainerAnnotations iterates through container components and returns all annotations
